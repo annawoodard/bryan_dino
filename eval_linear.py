@@ -21,20 +21,24 @@ import torch
 from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
-from torchvision import datasets
+from torchvision import datasets, transforms
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
+import torch.multiprocessing as mp
 
 import utils
 import vision_transformer as vits
+from utils import calculate_dataset_stats
+from ISPY2MRI import ISPY2MRIDataSet
 
 
-def eval_linear(args):
+def eval_linear(gpu, args):
+    args.gpu = gpu
+    args.rank = gpu
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     print(
-        "\n".join("%s: %s" % (k, str(v))
-                  for k, v in sorted(dict(vars(args)).items()))
+        "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
     )
     cudnn.benchmark = True
 
@@ -42,14 +46,14 @@ def eval_linear(args):
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
         model = vits.__dict__[args.arch](
-            patch_size=args.patch_size, num_classes=0)
+            patch_size=args.patch_size, in_chans=1, num_classes=0
+        )
         embed_dim = model.embed_dim * (
             args.n_last_blocks + int(args.avgpool_patchtokens)
         )
     # if the network is a XCiT
     elif "xcit" in args.arch:
-        model = torch.hub.load(
-            "facebookresearch/xcit:main", args.arch, num_classes=0)
+        model = torch.hub.load("facebookresearch/xcit:main", args.arch, num_classes=0)
         embed_dim = model.embed_dim
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
@@ -74,18 +78,24 @@ def eval_linear(args):
     )
 
     # ============ preparing data ... ============
+    # ADDED//
+    dataset_val = ISPY2MRIDataSet(args.sequences, "testing", transforms.ToTensor())
+    mean, std = calculate_dataset_stats(dataset_val)
+    # ///////
+
     val_transform = pth_transforms.Compose(
         [
             pth_transforms.Resize(256, interpolation=3),
             pth_transforms.CenterCrop(224),
             pth_transforms.ToTensor(),
-            pth_transforms.Normalize(
-                (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            # pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            pth_transforms.Normalize(mean, std),
         ]
     )
-    dataset_val = datasets.ImageFolder(
-        os.path.join(args.data_path, "val"), transform=val_transform
-    )
+    dataset_val = ISPY2MRIDataSet(args.sequences, "testing", transform=val_transform)
+    # dataset_val = datasets.ImageFolder(
+    #     os.path.join(args.data_path, "val"), transform=val_transform
+    # )
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -93,34 +103,46 @@ def eval_linear(args):
         pin_memory=True,
     )
 
-    if args.evaluate:
-        utils.load_pretrained_linear_weights(
-            linear_classifier, args.arch, args.patch_size
-        )
-        test_stats = validate_network(
-            val_loader,
-            model,
-            linear_classifier,
-            args.n_last_blocks,
-            args.avgpool_patchtokens,
-        )
-        print(
-            f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
-        )
-        return
+    # if args.evaluate:
+    #     # utils.load_pretrained_linear_weights(
+    #     #     linear_classifier, args.arch, args.patch_size
+    #     # )
+    #     test_stats = validate_network(
+    #         val_loader,
+    #         model,
+    #         linear_classifier,
+    #         args.n_last_blocks,
+    #         args.avgpool_patchtokens,
+    #         # ADDED
+    #         args,
+    #     )
+    #     print(
+    #         f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
+    #     )
+    #     return
+
+    # ADDED//
+    dataset_train = ISPY2MRIDataSet(args.sequences, "training", transforms.ToTensor())
+    mean, std = calculate_dataset_stats(dataset_train)
+    # ///////
 
     train_transform = pth_transforms.Compose(
         [
             pth_transforms.RandomResizedCrop(224),
             pth_transforms.RandomHorizontalFlip(),
             pth_transforms.ToTensor(),
-            pth_transforms.Normalize(
-                (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            # FIX NORMALIZE (for train + val)
+            # pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            pth_transforms.Normalize(mean, std),
         ]
     )
-    dataset_train = datasets.ImageFolder(
-        os.path.join(args.data_path, "train"), transform=train_transform
+    dataset_train = ISPY2MRIDataSet(
+        args.sequences, "training", transform=train_transform
     )
+
+    # dataset_train = datasets.ImageFolder(
+    #     os.path.join(args.data_path, "train"), transform=train_transform
+    # )
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -169,6 +191,7 @@ def eval_linear(args):
             epoch,
             args.n_last_blocks,
             args.avgpool_patchtokens,
+            args,
         )
         scheduler.step()
 
@@ -183,6 +206,8 @@ def eval_linear(args):
                 linear_classifier,
                 args.n_last_blocks,
                 args.avgpool_patchtokens,
+                # ADDED
+                args,
             )
             print(
                 f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
@@ -203,21 +228,21 @@ def eval_linear(args):
                 "scheduler": scheduler.state_dict(),
                 "best_acc": best_acc,
             }
-            torch.save(save_dict, os.path.join(
-                args.output_dir, "checkpoint.pth.tar"))
+            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
     print(
         "Training of the supervised linear classifier on frozen features completed.\n"
         "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc)
     )
 
 
-def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
+def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, args):
     linear_classifier.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter("lr", utils.SmoothedValue(
-        window_size=1, fmt="{value:.6f}"))
+    metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = "Epoch: [{}]".format(epoch)
     for (inp, target) in metric_logger.log_every(loader, 20, header):
+        # print("INP: ", inp)
+        # print("TARGET: ", target)
         # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
@@ -225,9 +250,9 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
         # forward
         with torch.no_grad():
             if "vit" in args.arch:
+                # print("OUTPUT: ")
                 intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0]
-                                   for x in intermediate_output], dim=-1)
+                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat(
                         (
@@ -241,6 +266,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
                     output = output.reshape(output.shape[0], -1)
             else:
                 output = model(inp)
+                # print("OUTPUT2: ", output)
         output = linear_classifier(output)
 
         # compute cross entropy loss
@@ -257,6 +283,17 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
         torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+        # #ADDING LOG/////////
+        # log_stats = {
+        #     **{f"train_loss": loss},
+        #     "epoch": epoch,
+        # }
+        # if utils.is_main_process():
+        #     with (Path(args.output_dir) / "log.txt").open("a") as f:
+        #         f.write(json.dumps(log_stats) + "\n")
+        # #///////////////////
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -264,7 +301,8 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
 
 
 @torch.no_grad()
-def validate_network(val_loader, model, linear_classifier, n, avgpool):
+def validate_network(val_loader, model, linear_classifier, n, avgpool, args):
+    # def validate_network(val_loader, model, linear_classifier, n, avgpool):
     linear_classifier.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Test:"
@@ -277,8 +315,7 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         with torch.no_grad():
             if "vit" in args.arch:
                 intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0]
-                                   for x in intermediate_output], dim=-1)
+                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat(
                         (
@@ -342,7 +379,7 @@ class LinearClassifier(nn.Module):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        "Evaluation with linear classification on ImageNet"
+        "Evaluation with linear classification on ISPYMRIData",
     )
     parser.add_argument(
         "--n_last_blocks",
@@ -358,8 +395,7 @@ if __name__ == "__main__":
         help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
         We typically set this to False for ViT-Small and to True with ViT-Base.""",
     )
-    parser.add_argument("--arch", default="vit_small",
-                        type=str, help="Architecture")
+    parser.add_argument("--arch", default="vit_small", type=str, help="Architecture")
     parser.add_argument(
         "--patch_size", default=16, type=int, help="Patch resolution of the model."
     )
@@ -428,5 +464,49 @@ if __name__ == "__main__":
         action="store_true",
         help="evaluate model on validation set",
     )
+    parser.add_argument(
+        "--sequences",
+        type=str,
+        nargs="+",
+        default="ISPY2_VOLSER_uni_lateral_cropped_PE2",
+        help="""Selects the Sequences to be used in the dataset.""",
+    )
+    # ///ADDED
+    # parser.add_argument(
+    #     "--world_size", default=None, type=int, help="number of distributed processes"
+    # )
+    # parser.add_argument(
+    #     "--devices",
+    #     type=str,
+    #     nargs="+",
+    #     default=None,
+    #     help="which devices to use on local machine",
+    # )
+    # ////
+    parser.add_argument(
+        "--world_size", default=None, type=int, help="number of distributed processes"
+    )
+    parser.add_argument(
+        "--devices",
+        type=str,
+        nargs="+",
+        default=None,
+        help="which devices to use on local machine",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="training",
+        help="dataset to be used in the process",
+    )
     args = parser.parse_args()
-    eval_linear(args)
+    args.port = str(utils.get_unused_local_port())
+    if args.devices is None:
+        args.devices = [f"{i}" for i in range(torch.cuda.device_count())]
+    if args.world_size is None:
+        args.world_size = len(args.devices)
+    mp.spawn(
+        eval_linear,
+        nprocs=len(args.devices),
+        args=(args,),
+    )
