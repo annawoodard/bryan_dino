@@ -35,10 +35,9 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from utils import calculate_dataset_stats
 
-from chimec import load_metadata, ChiMECSSLDataset, ChiMECStackedSSLDataset
-from maicara.data.constants import CHIMEC_MEAN, CHIMEC_STD
-from maicara.preprocessing.utils import log_code_state
+from ISPY2MRI import ISPY2MRIDataSet, split_data
 
 torchvision_archs = sorted(
     name
@@ -240,6 +239,18 @@ def get_args_parser():
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""",
     )
+    parser.add_argument(
+        "--sequences",
+        type=str,
+        nargs="+",
+        default="ISPY2_VOLSER_uni_lateral_cropped_PE2",
+        help="""Selects the Sequences to be used in the dataset.""",
+    )
+    parser.add_argument(
+        "--inputsize",
+        type=int,
+        help="""Input size of mips""",
+    )
 
     # Misc
     parser.add_argument(
@@ -315,20 +326,20 @@ def train_dino(gpu, args):
     # ============ preparing data ... ============
     # exclude any patients in testing set from pretraining set
     # fit = val + train sets
-    fit_metadata, test_metadata = load_metadata(args.test_size)
+    fit_metadata, test_metadata = split_data(args.test_size)
+    dataset = ISPY2MRIDataSet(args.sequences, "training", transforms.ToTensor())
+    mean, std = calculate_dataset_stats(dataset)
     transform = DataAugmentationDINO(
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
+        mean,
+        std,
     )
     # TODO do not hardcode size
-    SSLDataset = ChiMECStackedSSLDataset if args.stack_views else ChiMECSSLDataset
-    dataset = SSLDataset(
-        transform,
-        exclude=test_metadata.study_id,
-        image_size=224,
-        prescale=args.prescale,
-    )
+    # tried 448, 512, 720, 1200, 1600, 3200, 8000
+    dataset = ISPY2MRIDataSet(args.sequences, "training", transform, image_size=448)
+
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -338,6 +349,7 @@ def train_dino(gpu, args):
         pin_memory=True,
         drop_last=True,
     )
+    utils.write_example_dino_augs(dataset, args.output_dir)
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -540,14 +552,13 @@ def train_one_epoch(
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = "Epoch: [{}/{}]".format(epoch, args.epochs)
-    for it, images in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
-
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
@@ -557,6 +568,10 @@ def train_one_epoch(
             )  # only the 2 global views pass through the teacher
             student_output = student(images)
             loss = dino_loss(student_output, teacher_output, epoch)
+
+            # REPRESENTATION
+            # print("student output: ", student_output)
+            # print("teacher output: ", teacher_output)
 
         if not math.isfinite(loss.item()):
             logger.info("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -594,6 +609,11 @@ def train_one_epoch(
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+
+    # # CHECKING PARAMTERS
+    # for p in student.parameters():
+    #     print(p.grad)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     logger.info("Averaged stats: %s", metric_logger)
@@ -670,7 +690,14 @@ class DINOLoss(nn.Module):
 
 
 class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+    def __init__(
+        self,
+        global_crops_scale,
+        local_crops_scale,
+        local_crops_number,
+        mean,
+        std,
+    ):
         flip_and_color_jitter = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(p=0.5),
@@ -688,7 +715,7 @@ class DataAugmentationDINO(object):
         normalize = transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize(CHIMEC_MEAN, CHIMEC_STD),
+                transforms.Normalize(mean, std),
             ]
         )
 
@@ -696,7 +723,10 @@ class DataAugmentationDINO(object):
         self.global_transfo1 = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    224, scale=global_crops_scale, interpolation=Image.BICUBIC
+                    # 256
+                    256,
+                    scale=global_crops_scale,
+                    interpolation=Image.BICUBIC,
                 ),
                 flip_and_color_jitter,
                 utils.GaussianBlur(1.0),
@@ -707,7 +737,7 @@ class DataAugmentationDINO(object):
         self.global_transfo2 = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    224, scale=global_crops_scale, interpolation=Image.BICUBIC
+                    256, scale=global_crops_scale, interpolation=Image.BICUBIC
                 ),
                 flip_and_color_jitter,
                 utils.GaussianBlur(0.1),
@@ -720,7 +750,9 @@ class DataAugmentationDINO(object):
         self.local_transfo = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    96, scale=local_crops_scale, interpolation=Image.BICUBIC
+                    96,
+                    scale=local_crops_scale,
+                    interpolation=Image.BICUBIC,
                 ),
                 flip_and_color_jitter,
                 utils.GaussianBlur(p=0.5),
