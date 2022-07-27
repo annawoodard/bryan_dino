@@ -52,13 +52,22 @@ def split_data(
 
 
 class ISPY2MRIDataSet(Dataset):
-    def __init__(self, sequences, transform=None, image_size=448):
+    def __init__(self, sequences, dataset="training", transform=None, image_size=448):
         if not isinstance(sequences, list):
             sequences = [sequences]
         substring = "|".join(sequences)
-        data = pd.read_csv(
-            "/home/t-9bchoy/breast-cancer-treatment-prediction/processed_dataset.csv"
-        )
+        # data = pd.read_csv(
+        #     "/home/t-9bchoy/breast-cancer-treatment-prediction/processed_dataset.csv"
+        # )
+        # using the combined dataset
+        if dataset == "training":
+            data = pd.read_csv(
+                "/home/t-9bchoy/breast-cancer-treatment-prediction/train_processed_dataset_T012_one_hot.csv"
+            )
+        elif dataset == "testing":
+            data = pd.read_csv(
+                "/home/t-9bchoy/breast-cancer-treatment-prediction/test_processed_dataset_T012_one_hot.csv"
+            )
         self.xy = data[data["SHORTEN SEQUENCE"].str.contains(substring)]
 
         self.n_samples = len(self.xy)
