@@ -35,8 +35,83 @@ from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
 import git
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
 
 logger = logging.getLogger()
+
+
+def write_example_dino_augs(
+    dataset, output_directory, num_examples=10, local_crops_number=8
+):
+    patch_lists = []
+    for i, entry in enumerate(dataset):
+        patch_lists.append(entry)
+        if i == num_examples:
+            break
+    rc = {
+        "axes.spines.left": False,
+        "axes.spines.right": False,
+        "axes.spines.bottom": False,
+        "axes.spines.top": False,
+        "axes.grid": False,
+        "xtick.bottom": False,
+        "xtick.labelbottom": False,
+        "ytick.labelleft": False,
+        "ytick.left": False,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+    }
+    plt.rcParams.update(rc)
+    f, axes = plt.subplots(11, 2, figsize=(20, 40))
+    axes[0][0].set_title("global views")
+    axes[0][1].set_title("local views", pad=65)
+    for i, patches in enumerate(patch_lists):
+        global_views = make_grid(patches[0][:2], nrow=2)[
+            0,
+            :,
+        ]
+        local_views = make_grid(patches[0][2:], nrow=local_crops_number)[
+            0,
+            :,
+        ]
+        axes[i][0].imshow(
+            global_views,
+            cmap="gray",
+        )
+        axes[i][1].imshow(
+            local_views,
+            cmap="gray",
+        )
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_directory, "augmentation_examples.png"))
+    plt.savefig(os.path.join(output_directory, "augmentation_examples.pdf"))
+
+
+def calculate_dataset_stats(dataset, num_workers=4):
+    print("calculating dataset mean and standard deviation...")
+
+    loader = DataLoader(
+        dataset,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    means = []
+    stds = []
+    for image, _ in tqdm(loader):
+        image = image * 1.0  # pytorch will not compute mean/std of integers
+        means.append(torch.mean(image))
+        stds.append(torch.std(image))
+
+    mean = torch.mean(torch.tensor(means))
+    std = torch.mean(torch.tensor(stds))
+
+    logger.info(f"dataset mean: {mean}\ndataset std: {std}")
+    return mean, std
 
 
 def save(obj, path):
@@ -112,6 +187,63 @@ def get_unused_local_port():
     sock.close()
 
     return port
+
+
+def load_pretrained_weights(
+    model, pretrained_weights, checkpoint_key, model_name, patch_size
+):
+    if os.path.isfile(pretrained_weights):
+        state_dict = torch.load(pretrained_weights, map_location="cpu")
+        if checkpoint_key is not None and checkpoint_key in state_dict:
+            print(f"Take key {checkpoint_key} in provided checkpoint dict")
+            state_dict = state_dict[checkpoint_key]
+        # remove `module.` prefix
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        # remove `backbone.` prefix induced by multicrop wrapper
+        state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
+        msg = model.load_state_dict(state_dict, strict=False)
+        print(
+            "Pretrained weights found at {} and loaded with msg: {}".format(
+                pretrained_weights, msg
+            )
+        )
+    else:
+        print(
+            "Please use the `--pretrained_weights` argument to indicate the path of the checkpoint to evaluate."
+        )
+        url = None
+        if model_name == "vit_small" and patch_size == 16:
+            url = "dino_deitsmall16_pretrain/dino_deitsmall16_pretrain.pth"
+        elif model_name == "vit_small" and patch_size == 8:
+            url = "dino_deitsmall8_pretrain/dino_deitsmall8_pretrain.pth"
+        elif model_name == "vit_base" and patch_size == 16:
+            url = "dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
+        elif model_name == "vit_base" and patch_size == 8:
+            url = "dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth"
+        elif model_name == "xcit_small_12_p16":
+            url = "dino_xcit_small_12_p16_pretrain/dino_xcit_small_12_p16_pretrain.pth"
+        elif model_name == "xcit_small_12_p8":
+            url = "dino_xcit_small_12_p8_pretrain/dino_xcit_small_12_p8_pretrain.pth"
+        elif model_name == "xcit_medium_24_p16":
+            url = (
+                "dino_xcit_medium_24_p16_pretrain/dino_xcit_medium_24_p16_pretrain.pth"
+            )
+        elif model_name == "xcit_medium_24_p8":
+            url = "dino_xcit_medium_24_p8_pretrain/dino_xcit_medium_24_p8_pretrain.pth"
+        elif model_name == "resnet50":
+            url = "dino_resnet50_pretrain/dino_resnet50_pretrain.pth"
+        if url is not None:
+            print(
+                "Since no pretrained weights have been provided, we load the reference pretrained DINO weights."
+            )
+            state_dict = torch.hub.load_state_dict_from_url(
+                url="https://dl.fbaipublicfiles.com/dino/" + url
+            )
+            model.load_state_dict(state_dict, strict=True)
+        else:
+            print(
+                "There is no reference weights available for this model => We use random weights."
+            )
 
 
 def load_pretrained_checkpoint(model, pretrained_weights, checkpoint_key):
@@ -559,17 +691,18 @@ def setup_for_distributed(is_master):
 
 def init_distributed_mode(args):
     # launched with torch.distributed.launch
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
-    # launched with submitit on a slurm cluster
-    elif "SLURM_PROCID" in os.environ:
-        args.rank = int(os.environ["SLURM_PROCID"])
-        args.gpu = args.rank % torch.cuda.device_count()
-    # launched naively with `python main_dino.py`
-    # we manually add MASTER_ADDR and MASTER_PORT to env variables
-    elif torch.cuda.is_available():
+    # if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    #     args.rank = int(os.environ["RANK"])
+    #     args.world_size = int(os.environ["WORLD_SIZE"])
+    #     args.gpu = int(os.environ["LOCAL_RANK"])
+    # # launched with submitit on a slurm cluster
+    # elif "SLURM_PROCID" in os.environ:
+    #     args.rank = int(os.environ["SLURM_PROCID"])
+    #     args.gpu = args.rank % torch.cuda.device_count()
+    # # launched naively with `python main_dino.py`
+    # # we manually add MASTER_ADDR and MASTER_PORT to env variables
+    # elif torch.cuda.is_available(): [CHANGE TO THIS]
+    if torch.cuda.is_available():
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(args.port)
     else:
