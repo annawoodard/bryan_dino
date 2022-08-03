@@ -35,9 +35,10 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
-from utils import calculate_dataset_stats
+from utils import calculate_dataset_stats, calculate_patch_dataset_stats
 
-from ISPY2MRI import ISPY2MRIDataSet, split_data
+from ISPY2MRI import ISPY2MRIDataSet, ISPY2MRIRandomPatchSSLDataset
+from torch.utils.tensorboard import SummaryWriter
 
 torchvision_archs = sorted(
     name
@@ -326,9 +327,14 @@ def train_dino(gpu, args):
     # ============ preparing data ... ============
     # exclude any patients in testing set from pretraining set
     # fit = val + train sets
-    fit_metadata, test_metadata = split_data(args.test_size)
-    dataset = ISPY2MRIDataSet(args.sequences, "training", transforms.ToTensor())
-    mean, std = calculate_dataset_stats(dataset)
+    # fit_metadata, test_metadata = split_data(args.test_size)
+    # changed ISPY2MRIDataSet -> IPSY2MRIRandomPatchSSLDataset
+    dataset = ISPY2MRIRandomPatchSSLDataset(
+        args.sequences, "training", transforms.ToTensor()
+    )
+    # mean, std = calculate_dataset_stats(dataset)
+    # changed calculate_dataset_stats to calculate_patch_dataset_stats
+    mean, std = calculate_patch_dataset_stats(dataset)
     transform = DataAugmentationDINO(
         args.global_crops_scale,
         args.local_crops_scale,
@@ -338,7 +344,10 @@ def train_dino(gpu, args):
     )
     # TODO do not hardcode size
     # tried 448, 512, 720, 1200, 1600, 3200, 8000
-    dataset = ISPY2MRIDataSet(args.sequences, "training", transform, image_size=448)
+    # changed ISPY2MRIDataSet -> IPSY2MRIRandomPatchSSLDataset
+    dataset = ISPY2MRIRandomPatchSSLDataset(
+        args.sequences, "training", transform, image_size=448
+    )
 
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
@@ -461,8 +470,8 @@ def train_dino(gpu, args):
     # ============ optionally resume training ... ============
     to_restore = {
         "epoch": 0,
-        "fit_metadata": fit_metadata,
-        "test_metadata": test_metadata,
+        # "fit_metadata": fit_metadata,
+        # "test_metadata": test_metadata,
     }
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth"),
@@ -474,10 +483,12 @@ def train_dino(gpu, args):
         dino_loss=dino_loss,
     )
     start_epoch = to_restore["epoch"]
-    fit_metadata = to_restore["fit_metadata"]
-    test_metadata = to_restore["test_metadata"]
+    # fit_metadata = to_restore["fit_metadata"]
+    # test_metadata = to_restore["test_metadata"]
 
     early_stopping = utils.EarlyStopping(patience=args.patience)
+
+    log_writer = SummaryWriter(os.path.join(args.output_dir, "logs"))
 
     start_time = time.time()
     logger.info("Starting DINO training!")
@@ -485,7 +496,7 @@ def train_dino(gpu, args):
         data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
-        train_stats = train_one_epoch(
+        train_stats, last_teacher_output, last_student_output = train_one_epoch(
             student,
             teacher,
             teacher_without_ddp,
@@ -512,8 +523,8 @@ def train_dino(gpu, args):
             "epoch": epoch + 1,
             "args": args,
             "dino_loss": dino_loss.state_dict(),
-            "fit_metadata": fit_metadata,
-            "test_metadata": test_metadata,
+            # "fit_metadata": fit_metadata,
+            # "test_metadata": test_metadata,
             "in_chans": in_chans,
         }
         if fp16_scaler is not None:
@@ -528,8 +539,16 @@ def train_dino(gpu, args):
             "epoch": epoch,
         }
         if utils.is_main_process():
+            for key, value in train_stats.items():
+                log_writer.add_scalar(f"train/{key}", value, epoch)
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+            log_writer.add_histogram(
+                "teacher_representation", last_teacher_output, epoch
+            )
+            log_writer.add_histogram(
+                "student_representation", last_student_output, epoch
+            )
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info("Training time {}".format(total_time_str))
@@ -617,7 +636,11 @@ def train_one_epoch(
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     logger.info("Averaged stats: %s", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return (
+        {k: meter.global_avg for k, meter in metric_logger.meters.items()},
+        teacher_output,
+        student_output,
+    )
 
 
 class DINOLoss(nn.Module):
