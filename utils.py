@@ -91,6 +91,29 @@ def write_example_dino_augs(
     plt.savefig(os.path.join(output_directory, "augmentation_examples.pdf"))
 
 
+def calculate_patch_dataset_stats(dataset, num_workers=4):
+    print("calculating dataset mean and standard deviation...")
+
+    loader = DataLoader(
+        dataset,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    means = []
+    stds = []
+    for i, j in enumerate(tqdm(loader)):
+        j[0] = j[0] * 1.0  # pytorch will not compute mean/std of integers
+        means.append(torch.mean(j[0]))
+        stds.append(torch.std(j[0]))
+
+    mean = torch.mean(torch.tensor(means))
+    std = torch.mean(torch.tensor(stds))
+
+    logger.info(f"dataset mean: {mean}\ndataset std: {std}")
+    return mean, std
+
+
 def calculate_dataset_stats(dataset, num_workers=4):
     print("calculating dataset mean and standard deviation...")
 
@@ -704,7 +727,8 @@ def init_distributed_mode(args):
     # elif torch.cuda.is_available(): [CHANGE TO THIS]
     if torch.cuda.is_available():
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(args.port)
+        # os.environ["MASTER_PORT"] = str(args.port)
+        os.environ["MASTER_PORT"] = "29500"
     else:
         print("Does not support training without GPU.")
         sys.exit(1)
