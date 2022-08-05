@@ -34,25 +34,78 @@ def stratified_group_split(
     return samples_train, samples_test
 
 
-def split_data(
-    test_size,
-    data_path="/home/t-9bchoy/breast-cancer-treatment-prediction/processed_dataset.csv",
-):
-    data = pd.read_csv(data_path)
+# def split_data(
+#     test_size,
+#     data_path="/home/t-9bchoy/breast-cancer-treatment-prediction/processed_dataset.csv",
+# ):
+#     data = pd.read_csv(data_path)
 
-    if test_size > 0:
-        fit_data, test_data = stratified_group_split(
-            data, "PATIENT ID", "pcr", test_size
-        )
-    else:
-        fit_data = data
-        test_data = pd.DataFrame(columns=data.columns)
+#     if test_size > 0:
+#         fit_data, test_data = stratified_group_split(
+#             data, "PATIENT ID", "pcr", test_size
+#         )
+#     else:
+#         fit_data = data
+#         test_data = pd.DataFrame(columns=data.columns)
 
-    return fit_data, test_data
+#     return fit_data, test_data
+
+
+class ISPY2MRIRandomPatchSSLDataset(Dataset):
+    def __init__(
+        self,
+        sequences,
+        dataset="training",
+        transform=None,
+        image_size=256,
+        patch_size: int = 64,
+    ):
+        if not isinstance(sequences, list):
+            sequences = [sequences]
+        substring = "|".join(sequences)
+        if dataset == "training":
+            data = pd.read_csv(
+                "/home/t-9bchoy/breast-cancer-treatment-prediction/train_processed_dataset_T012_one_hot.csv"
+            )
+        elif dataset == "testing":
+            data = pd.read_csv(
+                "/home/t-9bchoy/breast-cancer-treatment-prediction/test_processed_dataset_T012_one_hot.csv"
+            )
+        self.xy = data[data["SHORTEN SEQUENCE"].str.contains(substring)]
+        self.image_size = to_2tuple(image_size)
+        # self.resize_and_random_crop = transforms.Compose(
+        #     [transforms.Resize(self.image_size), transforms.RandomCrop(patch_size)]
+        # )
+        self.random_crop = transforms.RandomCrop(patch_size)
+        self.transform = transform
+        self.patch_size = patch_size
+        w, h = self.image_size
+        # possibly change to manually set num_patches
+        self.num_patches = (w // patch_size) * (h // patch_size) * len(self.xy)
+
+    def __len__(self) -> int:
+        return self.num_patches
+
+    def __getitem__(self, index):
+        row = self.xy.iloc[index // len(self.xy)]
+        path = row["SEQUENCE PATH"]
+        image = self.random_crop(self.load_png(path))
+        if self.transform == None:
+            return image, row["pcr"]
+        else:
+            return self.transform(image), row["pcr"]
+
+    def load_png(self, filename):
+        try:
+            image = Image.open(filename).convert("L")
+        except OSError:
+            time.sleep(2)
+            image = Image.open(filename).convert("L")
+        return image
 
 
 class ISPY2MRIDataSet(Dataset):
-    def __init__(self, sequences, dataset="training", transform=None, image_size=448):
+    def __init__(self, sequences, dataset="training", transform=None, image_size=256):
         if not isinstance(sequences, list):
             sequences = [sequences]
         substring = "|".join(sequences)
@@ -72,12 +125,13 @@ class ISPY2MRIDataSet(Dataset):
 
         self.n_samples = len(self.xy)
         self.transform = transform
-        self.resize = transforms.Resize(to_2tuple(image_size))
+        # self.resize = transforms.Resize(to_2tuple(image_size))
 
     def __getitem__(self, index):
         row = self.xy.iloc[index]
         path = row["SEQUENCE PATH"]
-        image = self.resize(self.load_png(path))
+        # image = self.resize(self.load_png(path))
+        image = self.load_png(path)
         if self.transform == None:
             return image, row["pcr"]
         else:

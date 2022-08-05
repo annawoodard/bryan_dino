@@ -311,9 +311,7 @@ def get_args_parser():
     return parser
 
 
-def train_dino(gpu, args):
-    args.gpu = gpu
-    args.rank = gpu
+def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     cudnn.benchmark = True
@@ -323,18 +321,22 @@ def train_dino(gpu, args):
     logger.info(
         "\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items()))
     )
+    if utils.is_main_process():
+        utils.log_code_state(args.output_dir)
 
     # ============ preparing data ... ============
     # exclude any patients in testing set from pretraining set
     # fit = val + train sets
     # fit_metadata, test_metadata = split_data(args.test_size)
     # changed ISPY2MRIDataSet -> IPSY2MRIRandomPatchSSLDataset
-    dataset = ISPY2MRIRandomPatchSSLDataset(
-        args.sequences, "training", transforms.ToTensor()
-    )
+    # dataset = ISPY2MRIRandomPatchSSLDataset(
+    #     args.sequences, "training", transforms.ToTensor()
+    # )
     # mean, std = calculate_dataset_stats(dataset)
     # changed calculate_dataset_stats to calculate_patch_dataset_stats
-    mean, std = calculate_patch_dataset_stats(dataset)
+    # mean, std = calculate_patch_dataset_stats(dataset)
+    mean = torch.tensor(0.1063)
+    std = torch.tensor(0.0572)
     transform = DataAugmentationDINO(
         args.global_crops_scale,
         args.local_crops_scale,
@@ -346,7 +348,7 @@ def train_dino(gpu, args):
     # tried 448, 512, 720, 1200, 1600, 3200, 8000
     # changed ISPY2MRIDataSet -> IPSY2MRIRandomPatchSSLDataset
     dataset = ISPY2MRIRandomPatchSSLDataset(
-        args.sequences, "training", transform, image_size=448
+        args.sequences, "training", transform, image_size=256
     )
 
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -379,6 +381,15 @@ def train_dino(gpu, args):
     elif args.arch in torchvision_models.__dict__.keys():
         student = torchvision_models.__dict__[args.arch](in_chans=in_chans)
         teacher = torchvision_models.__dict__[args.arch](in_chans=in_chans)
+        # Added resnet for baseline
+        if "resnet" in args.arch:
+            # make grayscale
+            student.conv1 = nn.Conv2d(
+                1, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+            teacher.conv1 = nn.Conv2d(
+                1, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
         embed_dim = student.fc.weight.shape[1]
     else:
         logger.error(f"Unknow architecture: {args.arch}")
@@ -797,14 +808,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.seed is None:
         args.seed = torch.randint(0, 100000, (1,)).item()
-    if args.devices is None:
-        args.devices = [f"{i}" for i in range(torch.cuda.device_count())]
-    if args.world_size is None:
-        args.world_size = len(args.devices)
-    args.port = str(utils.get_unused_local_port())
+    # if args.devices is None:
+    #     args.devices = [f"{i}" for i in range(torch.cuda.device_count())]
+    # if args.world_size is None:
+    #     args.world_size = len(args.devices)
+    # args.port = str(utils.get_unused_local_port())
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    mp.spawn(
-        train_dino,
-        nprocs=len(args.devices),
-        args=(args,),
-    )
+    # mp.spawn(
+    #     train_dino,
+    #     nprocs=len(args.devices),
+    #     args=(args,),
+    # )
+    train_dino(args)
