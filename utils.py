@@ -39,8 +39,22 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
+from pathlib import Path
 
 logger = logging.getLogger()
+
+
+def prepare_output_dir(output_dir, autolabel, group=None):
+    if autolabel is True:
+        output_dir = os.path.join(
+            output_dir,
+            group
+            if group is not None
+            else datetime.datetime.now().strftime("%Y_%m_%d_%H_%M"),
+        )
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    return output_dir
 
 
 def write_example_dino_augs(

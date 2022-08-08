@@ -9,10 +9,11 @@ from timm.models.layers import to_2tuple
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
+import numpy as np
 import math
 from PIL import Image
 import time
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 
 
 def stratified_group_split(
@@ -105,7 +106,13 @@ class ISPY2MRIRandomPatchSSLDataset(Dataset):
 
 
 class ISPY2MRIDataSet(Dataset):
-    def __init__(self, sequences, dataset="training", transform=None, image_size=256):
+    def __init__(
+        self,
+        sequences,
+        transform=None,
+        image_size=256,
+        data=None,
+    ):
         if not isinstance(sequences, list):
             sequences = [sequences]
         substring = "|".join(sequences)
@@ -113,14 +120,14 @@ class ISPY2MRIDataSet(Dataset):
         #     "/home/t-9bchoy/breast-cancer-treatment-prediction/processed_dataset.csv"
         # )
         # using the combined dataset
-        if dataset == "training":
-            data = pd.read_csv(
-                "/home/t-9bchoy/breast-cancer-treatment-prediction/train_processed_dataset_T012_one_hot.csv"
-            )
-        elif dataset == "testing":
-            data = pd.read_csv(
-                "/home/t-9bchoy/breast-cancer-treatment-prediction/test_processed_dataset_T012_one_hot.csv"
-            )
+        # if dataset == "training":
+        #     data = pd.read_csv(
+        #         "/home/t-9bchoy/breast-cancer-treatment-prediction/train_processed_dataset_T012_one_hot.csv"
+        #     )
+        # elif dataset == "testing":
+        #     data = pd.read_csv(
+        #         "/home/t-9bchoy/breast-cancer-treatment-prediction/test_processed_dataset_T012_one_hot.csv"
+        #     )
         self.xy = data[data["SHORTEN SEQUENCE"].str.contains(substring)]
 
         self.n_samples = len(self.xy)
@@ -147,3 +154,55 @@ class ISPY2MRIDataSet(Dataset):
 
     def __len__(self):
         return self.n_samples
+
+
+def get_datasets(
+    train_transform, sequences, val_transform, n_splits, random_state, image_size=256
+):
+
+    fit_data = pd.read_csv(
+        "/home/t-9bchoy/breast-cancer-treatment-prediction/train_processed_dataset_T012_one_hot.csv"
+    )
+
+    cv = StratifiedGroupKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state
+    )
+    fit_indices = np.arange(len(fit_data))
+    # create validation and training splits for each fold
+    # the data is all from the training data, but val splits use val transforms
+    # the stratified group k fold class makes splits where patients do not cross splits
+    # (based on patient id) and we aim for similar ratios of pcr/non-pcr
+    fit_datasets = [
+        (
+            ISPY2MRIDataSet(
+                sequences,
+                transform=train_transform,
+                image_size=image_size,
+                data=fit_data.iloc[train_indices],
+            ),
+            ISPY2MRIDataSet(
+                sequences,
+                transform=val_transform,
+                image_size=image_size,
+                data=fit_data.iloc[val_indices],
+            ),
+        )
+        for train_indices, val_indices in cv.split(
+            fit_indices, fit_data["pcr"], fit_data["PATIENT ID"]
+        )
+    ]
+
+    test_data = pd.read_csv(
+        "/home/t-9bchoy/breast-cancer-treatment-prediction/test_processed_dataset_T012_one_hot.csv"
+    )
+    test_dataset = ISPY2MRIDataSet(
+        sequences,
+        data=test_data,
+        transform=val_transform,
+        image_size=image_size,
+    )
+
+    # log_summary("train + validation", fit_metadata)
+    # log_summary("testing", test_metadata)
+
+    return fit_datasets, test_dataset
