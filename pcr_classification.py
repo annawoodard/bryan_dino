@@ -85,7 +85,9 @@ def train_mil(args):
     # ============ building network ... ============
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
-        encoder = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
+        encoder = vits.__dict__[args.arch](
+            patch_size=args.patch_size, num_classes=0, in_chans=1
+        )
         embed_dim = encoder.embed_dim * (
             args.n_last_blocks + int(args.avgpool_patchtokens)
         )
@@ -534,7 +536,7 @@ def main(args):
             )
 
     # On None, we combine train and val datasets to train and test on held-out test dataset
-    work = args.folds + [None]
+    work = list(range(args.folds)) + [None]
     results = []
     for w in work:
         args.fold = w
