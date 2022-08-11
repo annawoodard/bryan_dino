@@ -33,15 +33,23 @@ import numpy as np
 import torch
 from torch import nn
 import torch.distributed as dist
-from PIL import ImageFilter, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 import git
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
 from pathlib import Path
+import pydicom
+from functools import lru_cache
+
 
 logger = logging.getLogger()
+
+
+@lru_cache(maxsize=None)
+def cached_load_png(path):
+    return Image.open(path).convert("L")
 
 
 def prepare_output_dir(output_dir, autolabel, group=None):

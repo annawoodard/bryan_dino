@@ -1,3 +1,4 @@
+import torch.distributed as dist
 import argparse
 import torch.nn.functional as F
 import torchmetrics
@@ -33,7 +34,7 @@ volser_std = torch.tensor(0.0572)
 
 
 def train_mil(args):
-    utils.init_distributed_mode(args)
+    # utils.init_distributed_mode(args)
     if args.seed is None:
         args.seed = torch.randint(0, 100000, (1,)).item()
     utils.fix_random_seeds(args.seed)
@@ -159,7 +160,7 @@ def train_mil(args):
             optimizer,
             fit_loader,
             epoch,
-            args.batch_size,
+            args.n_last_blocks,
             args.avgpool_patchtokens,
             args.arch,
         )
@@ -237,7 +238,7 @@ def train_mil(args):
     result = test_stats if args.fold == None else val_stats
     result["fold"] = args.fold
 
-    return results
+    return result
 
 
 def train(model, optimizer, loader, epoch, n, avgpool, arch):
@@ -249,11 +250,18 @@ def train(model, optimizer, loader, epoch, n, avgpool, arch):
     for (inp, target) in metric_logger.log_every(loader, 20, header):
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
+        one_hot_target = F.one_hot(target, num_classes=2)
 
         # forward
         # with torch.no_grad():
         if "vit" in arch:
-            intermediate_output = model.net.get_intermediate_layers(inp, n)
+            inp = inp.squeeze(0)
+
+            # b, t, c, h, w: dimensions for batch, tile, color, height, width
+            # we reshape to stack all of the tiles in the batch dimension
+            b, t, c, h, w = inp.size()
+            inp = inp.reshape((b * t, c, h, w))
+            intermediate_output = model.module.net.get_intermediate_layers(inp, n)
             output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
             if avgpool:
                 output = torch.cat(
@@ -264,6 +272,8 @@ def train(model, optimizer, loader, epoch, n, avgpool, arch):
                     dim=-1,
                 )
                 output = output.reshape(output.shape[0], -1)
+            output = output.reshape(b, t, -1)
+            output = model.module.calc_head(output)
         else:
             output = model(inp)
 
@@ -306,7 +316,13 @@ def validate_network(val_loader, model, n, avgpool, arch):
 
         with torch.no_grad():
             if "vit" in arch:
-                intermediate_output = model.net.get_intermediate_layers(inp, n)
+                inp = inp.squeeze(0)
+
+                # b, t, c, h, w: dimensions for batch, tile, color, height, width
+                # we reshape to stack all of the tiles in the batch dimension
+                b, t, c, h, w = inp.size()
+                inp = inp.reshape((b * t, c, h, w))
+                intermediate_output = model.module.net.get_intermediate_layers(inp, n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat(
@@ -319,11 +335,13 @@ def validate_network(val_loader, model, n, avgpool, arch):
                         dim=-1,
                     )
                     output = output.reshape(output.shape[0], -1)
+                output = output.reshape(b, t, -1)
+                output = model.module.calc_head(output)
             else:
                 output = model(inp)
         loss = nn.CrossEntropyLoss()(output, target)
 
-        auc.update(output, one_hot_target)
+        auc.update(output, target)
         acc.update(output, target)
 
         metric_logger.update(loss=loss.item())
@@ -477,7 +495,7 @@ def get_args_parser():
     )
     parser.add_argument(
         "--tile_size",
-        default=(224, 224),
+        default=(64, 64),
         nargs="+",
         type=int,
         help="""Size in pixels to divide input image for tile-based training""",
@@ -497,64 +515,70 @@ def get_args_parser():
 def main(args):
     start = time.time()
     args.output_dir = utils.prepare_output_dir(args.output_dir, args.autolabel)
-    utils.log_code_state(args.output_dir)
 
     logger = utils.setup_logging(args.output_dir, f"main")
-    if not os.path.isfile(os.path.join(args.output_dir, "datasets.pth.tar")):
-        val_transform = pth_transforms.Compose(
-            [
-                pth_transforms.ToTensor(),
-                pth_transforms.Normalize(volser_mean, volser_std),
-                GridTile(tile_size=args.tile_size, max_frac_black=0.96),
-            ]
-        )
-        train_transform = pth_transforms.Compose(
-            [
-                pth_transforms.RandomHorizontalFlip(),
-                pth_transforms.ToTensor(),
-                pth_transforms.Normalize(volser_mean, volser_std),
-                RandGridTile(tile_size=args.tile_size, max_frac_black=0.96),
-            ]
-        )
-
-        fit_datasets, test_dataset = get_datasets(
-            train_transform,
-            args.sequences,
-            val_transform,
-            args.folds,
-            args.seed,
-            image_size=256,
-        )
-        torch.save(
-            {"fit_datasets": fit_datasets, "test_dataset": test_dataset},
-            os.path.join(args.output_dir, "datasets.pth.tar"),
-        )
-        logger.info(f"Data loaded")
-        for i, (train_dataset, val_dataset) in enumerate(fit_datasets):
-            logger.info(
-                f"Fold {i}: {len(train_dataset)} training views and {len(val_dataset)} val views"
+    utils.init_distributed_mode(args)
+    # hack assumes we are running iwth slurm
+    if utils.is_main_process():
+        utils.log_code_state(args.output_dir)
+        if not os.path.isfile(os.path.join(args.output_dir, "datasets.pth.tar")):
+            val_transform = pth_transforms.Compose(
+                [
+                    pth_transforms.ToTensor(),
+                    pth_transforms.Normalize(volser_mean, volser_std),
+                    # FIXME do not hardcode overlap
+                    GridTile(tile_size=args.tile_size, overlap=0.2),
+                ]
             )
+            train_transform = pth_transforms.Compose(
+                [
+                    pth_transforms.RandomHorizontalFlip(),
+                    pth_transforms.ToTensor(),
+                    pth_transforms.Normalize(volser_mean, volser_std),
+                    RandGridTile(tile_size=args.tile_size),
+                ]
+            )
+
+            fit_datasets, test_dataset = get_datasets(
+                train_transform,
+                args.sequences,
+                val_transform,
+                args.folds,
+                args.seed,
+                image_size=256,
+            )
+            torch.save(
+                {"fit_datasets": fit_datasets, "test_dataset": test_dataset},
+                os.path.join(args.output_dir, "datasets.pth.tar"),
+            )
+            logger.info(f"Data loaded")
+            for i, (train_dataset, val_dataset) in enumerate(fit_datasets):
+                logger.info(
+                    f"Fold {i}: {len(train_dataset)} training views and {len(val_dataset)} val views"
+                )
 
     # On None, we combine train and val datasets to train and test on held-out test dataset
     work = list(range(args.folds)) + [None]
     results = []
+    dist.barrier()
     for w in work:
         args.fold = w
         results += [train_mil(args)]
 
-    results = pd.DataFrame(results)
-    logger.info(
-        "training completed in {:.1f} minutes with mean validation accuracy {:.3f} +/ {:.3f}; test accuracy {:.3f}".format(
-            (time.time() - start) / 60.0,
-            results.acc.mean(),
-            results.acc.std(),
-            results[pd.isnull(results.fold)].acc.iloc[0],
+    if utils.utils.is_main_process():
+        results = pd.DataFrame(results)
+        logger.info(
+            "training completed in {:.1f} minutes with mean validation accuracy {:.3f} +/ {:.3f}; test accuracy {:.3f}".format(
+                (time.time() - start) / 60.0,
+                results.acc.mean(),
+                results.acc.std(),
+                results[pd.isnull(results.fold)].acc.iloc[0],
+            )
         )
-    )
 
-    results.to_pickle(Path(args.output_dir) / "results.pkl")
-    with (Path(args.output_dir) / "args.json").open("w") as f:
-        f.write(json.dumps(vars(args)) + "\n")
+        results.to_pickle(Path(args.output_dir) / "results.pkl")
+        with (Path(args.output_dir) / "args.json").open("w") as f:
+            f.write(json.dumps(vars(args)) + "\n")
 
     # TODO
     # if args.project is not None:

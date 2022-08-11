@@ -90,7 +90,7 @@ class GridTile(Transform):
         )
         tiles = list(zip(*tile_iterator))
         tiled_image = np.array(tiles[0])
-        locations = np.array(tiles[1])[:, 1:, 0]  # only keep the starting location
+        # locations = np.array(tiles[1])[:, 1:, 0]  # only keep the starting location
 
         # Filter tiles
         if self.max_frac_black:
