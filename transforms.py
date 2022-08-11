@@ -5,6 +5,7 @@ import numpy as np
 
 from monai.config.type_definitions import NdarrayOrTensor
 from monai.data.utils import iter_patch
+from monai.transforms.transform import MapTransform, Randomizable
 
 from monai.transforms.utils import convert_pad_mode
 from monai.utils import (
@@ -16,6 +17,7 @@ from monai.utils import (
 from monai.transforms.transform import RandomizableTransform, Transform
 from monai.utils.enums import PytorchPadMode, TransformBackends
 from monai.utils.type_conversion import convert_data_type
+from monai.apps.pathology.transforms.spatial.array import TileOnGrid
 
 
 class GridTile(Transform):
@@ -100,62 +102,121 @@ class GridTile(Transform):
         return torch.Tensor(tiled_image)
 
 
-class RandGridTile(GridTile, RandomizableTransform):
+class RandGridTile(Randomizable, Transform):
     """
-    Extract all the tiles sweeping the entire image in a row-major sliding-window manner with possible overlaps,
-    and with random offset for the minimal corner of the image, (0,0) for 2D and (0,0,0) for 3D.
-    It can sort the patches and return all or a subset of them.
-    Adapted from MONAI from pathology-centric focus (fixed number of tiles with sorting) to radiology-centric focus (all non-background tiles).
-    https://github.com/Project-MONAI/MONAI/blob/dev/monai/transforms/spatial/array.py
+    Tile the 2D image into patches on a grid and maintain a subset of it.
+    This transform works only with np.ndarray inputs for 2D images.
+
     Args:
-        tile_size: size of tiles to generate slices for, 0 or None selects whole dimension
-        min_offset: the minimum range of offset to be selected randomly. Defaults to 0.
-        max_offset: the maximum range of offset to be selected randomly.
-            Defaults to image size modulo tile size.
-        overlap: the amount of overlap of neighboring tiles in each dimension (a value between 0.0 and 1.0).
-            If only one float number is given, it will be applied to all dimensions. Defaults to 0.0.
-        pad_mode: refer to NumpyPadMode and PytorchPadMode. If None, no padding will be applied. Defaults to ``"constant"``.
-        pad_kwargs: other arguments for the `np.pad` or `torch.pad` function.
+        tile_count: number of tiles to extract, if None extracts all non-background tiles
+            Defaults to ``None``.
+        tile_size: size of the square tile
+            Defaults to ``256``.
+        step: step size
+            Defaults to ``None`` (same as tile_size)
+        random_offset: Randomize position of the grid, instead of starting from the top-left corner
+            Defaults to ``False``.
+        pad_full: pad image to the size evenly divisible by tile_size
+            Defaults to ``False``.
+        background_val: the background constant (e.g. 255 for white background)
+            Defaults to ``255``.
+        filter_mode: mode must be in ["min", "max", "random"]. If total number of tiles is more than tile_size,
+            then sort by intensity sum, and take the smallest (for min), largest (for max) or random (for random) subset
+            Defaults to ``min`` (which assumes background is high value)
+
     """
 
     backend = [TransformBackends.TORCH, TransformBackends.NUMPY]
 
     def __init__(
         self,
-        tile_size: Sequence[int],
-        min_offset: Optional[Union[Sequence[int], int]] = None,
-        max_offset: Optional[Union[Sequence[int], int]] = None,
-        max_frac_black: Optional[float] = None,
-        pad_mode: str = PytorchPadMode.CONSTANT,
-        **pad_kwargs,
+        tile_count: Optional[int] = None,
+        tile_size: int = 256,
+        step: Optional[int] = None,
+        random_offset: bool = False,
+        pad_full: bool = False,
+        background_val: int = 255,
+        filter_mode: str = "min",
     ):
-        super().__init__(
+        self.seed = None
+
+        self.splitter = TileOnGrid(
+            tile_count=tile_count,
             tile_size=tile_size,
-            offset=(),
-            overlap=0.0,
-            max_frac_black=max_frac_black,
-            pad_mode=pad_mode,
-            **pad_kwargs,
-        )
-        self.min_offset = min_offset
-        self.max_offset = max_offset
-
-    def randomize(self, array):
-        if self.min_offset is None:
-            min_offset = (0,) * len(self.tile_size)
-        else:
-            min_offset = ensure_tuple_rep(self.min_offset, len(self.tile_size))
-        if self.max_offset is None:
-            max_offset = tuple(s % p for s, p in zip(array.shape[1:], self.tile_size))
-        else:
-            max_offset = ensure_tuple_rep(self.max_offset, len(self.tile_size))
-
-        self.offset = tuple(
-            self.R.randint(low=low, high=high + 1)
-            for low, high in zip(min_offset, max_offset)
+            step=step,
+            random_offset=random_offset,
+            pad_full=pad_full,
+            background_val=background_val,
+            filter_mode=filter_mode,
         )
 
-    def __call__(self, array: NdarrayOrTensor, randomize: bool = True):
-        if randomize:
-            self.randomize(array)
-        return super().__call__(array)
+    def randomize(self, data: Any = None) -> None:
+        self.seed = self.R.randint(10000)  # type: ignore
+
+    def __call__(self, data: NdarrayOrTensor) -> NdarrayOrTensor:
+
+        self.randomize()
+        self.splitter.set_random_state(seed=self.seed)
+
+        return self.splitter(data)
+
+
+# class RandGridTile(GridTile, RandomizableTransform):
+#     """
+#     Extract all the tiles sweeping the entire image in a row-major sliding-window manner with possible overlaps,
+#     and with random offset for the minimal corner of the image, (0,0) for 2D and (0,0,0) for 3D.
+#     It can sort the patches and return all or a subset of them.
+#     Adapted from MONAI from pathology-centric focus (fixed number of tiles with sorting) to radiology-centric focus (all non-background tiles).
+#     https://github.com/Project-MONAI/MONAI/blob/dev/monai/transforms/spatial/array.py
+#     Args:
+#         tile_size: size of tiles to generate slices for, 0 or None selects whole dimension
+#         min_offset: the minimum range of offset to be selected randomly. Defaults to 0.
+#         max_offset: the maximum range of offset to be selected randomly.
+#             Defaults to image size modulo tile size.
+#         overlap: the amount of overlap of neighboring tiles in each dimension (a value between 0.0 and 1.0).
+#             If only one float number is given, it will be applied to all dimensions. Defaults to 0.0.
+#         pad_mode: refer to NumpyPadMode and PytorchPadMode. If None, no padding will be applied. Defaults to ``"constant"``.
+#         pad_kwargs: other arguments for the `np.pad` or `torch.pad` function.
+#     """
+
+#     backend = [TransformBackends.TORCH, TransformBackends.NUMPY]
+
+#     def __init__(
+#         self,
+#         tile_size: Sequence[int],
+#         min_offset: Optional[Union[Sequence[int], int]] = None,
+#         max_offset: Optional[Union[Sequence[int], int]] = None,
+#         max_frac_black: Optional[float] = None,
+#         pad_mode: str = PytorchPadMode.CONSTANT,
+#         **pad_kwargs,
+#     ):
+#         super().__init__(
+#             tile_size=tile_size,
+#             offset=(),
+#             overlap=0.0,
+#             max_frac_black=max_frac_black,
+#             pad_mode=pad_mode,
+#             **pad_kwargs,
+#         )
+#         self.min_offset = min_offset
+#         self.max_offset = max_offset
+
+#     def randomize(self, array):
+#         if self.min_offset is None:
+#             min_offset = (0,) * len(self.tile_size)
+#         else:
+#             min_offset = ensure_tuple_rep(self.min_offset, len(self.tile_size))
+#         if self.max_offset is None:
+#             max_offset = tuple(s % p for s, p in zip(array.shape[1:], self.tile_size))
+#         else:
+#             max_offset = ensure_tuple_rep(self.max_offset, len(self.tile_size))
+
+#         self.offset = tuple(
+#             self.R.randint(low=low, high=high + 1)
+#             for low, high in zip(min_offset, max_offset)
+#         )
+
+#     def __call__(self, array: NdarrayOrTensor, randomize: bool = True):
+#         if randomize:
+#             self.randomize(array)
+#         return super().__call__(array)

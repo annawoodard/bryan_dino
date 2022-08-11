@@ -111,7 +111,6 @@ class ISPY2MRIDataSet(Dataset):
         self,
         sequences,
         transform=None,
-        image_size=256,
         data=None,
         dataset=None,
     ):
@@ -134,12 +133,11 @@ class ISPY2MRIDataSet(Dataset):
 
         self.n_samples = len(self.xy)
         self.transform = transform
-        self.resize = transforms.Resize(to_2tuple(image_size))
 
     def __getitem__(self, index):
         row = self.xy.iloc[index]
         path = row["SEQUENCE PATH"]
-        image = self.resize(cached_load_png(path))
+        image = cached_load_png(path)
 
         if self.transform == None:
             return image, row["pcr"]
@@ -158,9 +156,7 @@ class ISPY2MRIDataSet(Dataset):
         return self.n_samples
 
 
-def get_datasets(
-    train_transform, sequences, val_transform, n_splits, random_state, image_size=256
-):
+def get_datasets(train_transform, sequences, val_transform, n_splits, random_state):
 
     fit_data = pd.read_csv(
         "/home/t-9bchoy/breast-cancer-treatment-prediction/train_processed_dataset_T012_one_hot.csv"
@@ -179,13 +175,11 @@ def get_datasets(
             ISPY2MRIDataSet(
                 sequences,
                 transform=train_transform,
-                image_size=image_size,
                 data=fit_data.iloc[train_indices],
             ),
             ISPY2MRIDataSet(
                 sequences,
                 transform=val_transform,
-                image_size=image_size,
                 data=fit_data.iloc[val_indices],
             ),
         )
@@ -201,7 +195,6 @@ def get_datasets(
         sequences,
         data=test_data,
         transform=val_transform,
-        image_size=image_size,
     )
 
     # log_summary("train + validation", fit_metadata)
